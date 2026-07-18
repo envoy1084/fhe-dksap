@@ -1,7 +1,7 @@
 # FHE-DKSAP for Rust
 
-[![CI](https://github.com/Envoy-VC/fhe-dksap/actions/workflows/ci.yml/badge.svg)](https://github.com/Envoy-VC/fhe-dksap/actions/workflows/ci.yml)
-[![Coverage](https://github.com/Envoy-VC/fhe-dksap/actions/workflows/coverage.yml/badge.svg)](https://github.com/Envoy-VC/fhe-dksap/actions/workflows/coverage.yml)
+[![CI](https://github.com/envoy1084/fhe-dksap/actions/workflows/ci.yml/badge.svg)](https://github.com/envoy1084/fhe-dksap/actions/workflows/ci.yml)
+[![Coverage](https://github.com/envoy1084/fhe-dksap/actions/workflows/coverage.yml/badge.svg)](https://github.com/envoy1084/fhe-dksap/actions/workflows/coverage.yml)
 [![docs.rs](https://img.shields.io/docsrs/fhe_dksap)](https://docs.rs/fhe_dksap)
 [![Crates.io](https://img.shields.io/crates/v/fhe_dksap)](https://crates.io/crates/fhe_dksap)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

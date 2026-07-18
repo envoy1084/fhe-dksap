@@ -32,5 +32,5 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - Initial research implementation.
 
-[0.2.0]: https://github.com/Envoy-VC/fhe-dksap/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Envoy-VC/fhe-dksap/releases/tag/v0.1.0
+[0.2.0]: https://github.com/envoy1084/fhe-dksap/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/envoy1084/fhe-dksap/releases/tag/v0.1.0
