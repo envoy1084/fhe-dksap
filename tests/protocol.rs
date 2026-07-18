@@ -191,6 +191,10 @@ fn fhe_key_mismatches_are_rejected_before_evaluation_or_decryption() {
         decrypt_stealth_secret(&secp, keys.client_key(), &wrong_tag),
         Err(Error::FheKeyMismatch)
     ));
+    assert!(matches!(
+        recover_secret_key(&secp, keys, &encrypted, &wrong_tag),
+        Err(Error::FheKeyMismatch)
+    ));
 
     let mut empty_tag = encrypted.clone();
     empty_tag.tag_mut().set_data(&[]);

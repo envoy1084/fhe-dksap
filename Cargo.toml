@@ -1,6 +1,6 @@
 [package]
 name = "fhe_dksap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Vedant Chainani <vedantchainani1084@gmail.com>"]
 description = "Fully Homomorphic Encryption based Dual-Key Stealth Address Protocol for enhanced privacy in blockchain transactions"
@@ -15,6 +15,7 @@ rust-version = "1.91.1"
 
 # Publishing configuration
 publish = true
+exclude = [".github/"]
 
 [features]
 default = []
