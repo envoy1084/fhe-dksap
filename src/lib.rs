@@ -1,462 +1,390 @@
-//! # FHE-DKSAP: Fully Homomorphic Encryption Dual-Key Stealth Address Protocol
+//! FHE-DKSAP primitives for Ethereum-compatible stealth addresses.
 //!
-//! This library implements a privacy-preserving stealth address protocol for Ethereum using
-//! Fully Homomorphic Encryption (FHE). The protocol allows senders to create stealth addresses
-//! that only the intended receiver can spend from, while maintaining privacy of both parties.
+//! This crate implements the construction described in the Ethereum Research
+//! FHE-DKSAP post: a sender adds an ephemeral secp256k1 public key to a
+//! receiver's spending public key, while encrypting the matching ephemeral
+//! scalar under the receiver's TFHE public key. An evaluator can homomorphically
+//! add the encrypted scalars modulo the secp256k1 group order, and only the
+//! receiver can decrypt the resulting spending key.
 //!
-//! ## Overview
+//! # Important limitations
 //!
-//! The FHE-DKSAP protocol combines:
-//! - **Dual-Key Stealth Address Protocol (DKSAP)**: A privacy-preserving address generation scheme
-//! - **Fully Homomorphic Encryption (FHE)**: Enables computation on encrypted data without decryption
-//! - **secp256k1**: The elliptic curve used by Ethereum for key generation and signing
-//!
-//! ## Dependencies
-//!
-//! - `tfhe`: Fully Homomorphic Encryption library
-//! - `secp256k1`: Elliptic curve cryptography for Ethereum compatibility
-//! - `sha3`: Cryptographic hash functions for address generation
-//!
-//! ## Performance Considerations
-//!
-//! FHE operations are computationally expensive. The library is designed for privacy-critical
-//! applications where the computational overhead is acceptable for enhanced privacy guarantees.
-//!
-//! ## Security Notes
-//!
-//! - FHE keys should be generated with appropriate security parameters
-//! - New Stealth Addresses should be generated for each transaction basis
+//! This is an experimental protocol, not a standardized or independently
+//! audited construction. FHE protects the scalar-recovery computation, but the
+//! resulting Ethereum spending key still uses secp256k1 and is therefore not
+//! post-quantum secure. See the repository's `SECURITY.md` for the threat model.
 
-use secp256k1::{rand, PublicKey, Secp256k1, SecretKey};
-use std::error::Error;
-use std::fmt;
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
-use tfhe::{generate_keys, prelude::*, set_server_key, ClientKey, Config, FheUint256, ServerKey};
+use core::fmt;
 
-pub mod utils;
+use secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey, rand};
+use tfhe::{
+    ClientKey, Config, FheUint256, PublicKey as FhePublicKey, ServerKey, generate_keys,
+    prelude::{FheDecrypt, FheEncrypt, FheOrd, IfThenElse, Tagged},
+    with_server_key_as_context,
+};
 
-/// Errors that can occur during FHE-DKSAP operations.
-///
-/// This enum provides detailed error information for debugging and error handling
-/// in production environments.
-#[derive(Debug)]
-pub enum FheDKSAPError {
-    /// Error during key generation operations
-    ///
-    /// This error occurs when there are issues generating cryptographic keys,
-    /// such as insufficient entropy or invalid key parameters.
-    KeyGenerationError(String),
-    /// Error during public key combination operations
-    ///
-    /// This error occurs when attempting to combine secp256k1 public keys,
-    /// typically due to invalid key formats or cryptographic constraints.
-    KeyCombinationError(String),
+mod utils;
+
+pub use utils::SECP256K1_ORDER_BYTES;
+
+/// Errors returned by FHE-DKSAP protocol operations.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    /// The two secp256k1 points add to the point at infinity.
+    #[error("the spending and ephemeral public keys cancel to the point at infinity")]
+    PointAtInfinity,
+
+    /// Ciphertexts and keys do not belong to the same TFHE key set.
+    #[error("TFHE key tag mismatch; ciphertexts and keys must use one receiver key set")]
+    FheKeyMismatch,
+
+    /// Homomorphic reduction produced zero, which is not a valid secp256k1 secret.
+    #[error("the recovered scalar is zero and cannot be a secp256k1 secret key")]
+    ZeroScalar,
+
+    /// The recovered bytes were not a valid secp256k1 scalar.
+    #[error("the recovered scalar is not a valid secp256k1 secret key: {0}")]
+    InvalidScalar(String),
 }
 
-impl fmt::Display for FheDKSAPError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FheDKSAPError::KeyGenerationError(msg) => write!(f, "Key generation error: {}", msg),
-            FheDKSAPError::KeyCombinationError(msg) => write!(f, "Key combination error: {}", msg),
+/// Result type used by this crate.
+pub type Result<T> = core::result::Result<T, Error>;
+
+/// A secp256k1 secret/public key pair.
+#[derive(Clone)]
+pub struct EthereumKeyPair {
+    secret_key: SecretKey,
+    public_key: Secp256k1PublicKey,
+}
+
+impl EthereumKeyPair {
+    /// Constructs a key pair from an existing secret key.
+    #[must_use]
+    pub fn from_secret_key<C: secp256k1::Signing>(
+        secp: &Secp256k1<C>,
+        secret_key: SecretKey,
+    ) -> Self {
+        let public_key = secret_key.public_key(secp);
+        Self {
+            secret_key,
+            public_key,
         }
+    }
+
+    /// Returns the secret key.
+    #[must_use]
+    pub const fn secret_key(&self) -> &SecretKey {
+        &self.secret_key
+    }
+
+    /// Returns the public key.
+    #[must_use]
+    pub const fn public_key(&self) -> &Secp256k1PublicKey {
+        &self.public_key
     }
 }
 
-impl Error for FheDKSAPError {}
-
-/// Result type for FHE-DKSAP operations.
-///
-/// Provides a convenient type alias for operations that can fail with
-/// `FheDKSAPError`.
-pub type FheDKSAPResult<T> = Result<T, FheDKSAPError>;
-
-/// A pair of secp256k1 keys for Ethereum operations.
-///
-/// This struct holds both the secret and public keys needed for Ethereum
-/// transactions and stealth address operations. The secret key is used for
-/// signing transactions, while the public key is used for address generation
-/// and key combination operations.
-#[derive(Debug, Clone)]
-pub struct EthereumKeyPair {
-    /// The secret key used for signing transactions
-    pub secret_key: SecretKey,
-    /// The public key derived from the secret key
-    pub public_key: PublicKey,
+impl fmt::Debug for EthereumKeyPair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EthereumKeyPair")
+            .field("secret_key", &"<redacted>")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
 }
 
-/// A pair of FHE keys for encrypted operations.
+/// The receiver's TFHE client, server, and public keys.
 ///
-/// This struct holds the client and server keys needed for FHE operations.
-/// The client key is used for encryption and decryption, while the server key
-/// is used for performing computations on encrypted data.
-#[derive(Clone)]
+/// The client key is secret. The public key is safe to give to senders and the
+/// server key is safe to give to evaluators, although both public artifacts can
+/// be large. The generated TFHE tag is an accidental-misuse guard; it is not an
+/// authentication mechanism and must not replace authenticated transport.
 pub struct FheKeyPair {
-    /// The client key used for encryption and decryption
-    pub public_key: ClientKey,
-    /// The server key used for FHE computations
-    pub secret_key: ServerKey,
+    client_key: ClientKey,
+    server_key: ServerKey,
+    public_key: FhePublicKey,
 }
 
-/// A stealth address with associated encrypted data.
+impl FheKeyPair {
+    /// Returns the secret TFHE client key used for decryption.
+    #[must_use]
+    pub const fn client_key(&self) -> &ClientKey {
+        &self.client_key
+    }
+
+    /// Returns the public TFHE evaluation key.
+    #[must_use]
+    pub const fn server_key(&self) -> &ServerKey {
+        &self.server_key
+    }
+
+    /// Returns the TFHE encryption key that can be shared with senders.
+    #[must_use]
+    pub const fn public_key(&self) -> &FhePublicKey {
+        &self.public_key
+    }
+}
+
+impl fmt::Debug for FheKeyPair {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FheKeyPair")
+            .field("client_key", &"<redacted>")
+            .field("server_key", &"<evaluation key>")
+            .field("public_key", &"<encryption key>")
+            .finish()
+    }
+}
+
+/// A 20-byte Ethereum address.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EthereumAddress([u8; 20]);
+
+impl EthereumAddress {
+    /// Constructs an address from its exact 20-byte representation.
+    #[must_use]
+    pub const fn new(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw 20 address bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EthereumAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "0x{}", hex::encode(self.0))
+    }
+}
+
+impl fmt::Debug for EthereumAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+/// The public announcement a sender publishes for one payment.
 ///
-/// This struct contains all the information needed to create and recover
-/// a stealth address. The stealth address is the public address that can
-/// receive funds, while the encrypted secret key contains the information
-/// needed to recover the private key for spending.
-#[derive(Clone)]
+/// It intentionally does not expose or retain the sender's ephemeral secret.
 pub struct StealthAddress {
-    /// The Ethereum stealth address in hex format (0x-prefixed)
-    pub stealth_address: String,
-    /// The ephemeral secret key encrypted with the receiver's FHE public key
-    pub encrypted_secret_key: FheUint256,
-    /// The ephemeral key pair used to generate this stealth address
-    pub ephemeral_key_pair: EthereumKeyPair,
+    address: EthereumAddress,
+    encrypted_ephemeral_secret: FheUint256,
 }
 
-/// Generates a new secp256k1 key pair for Ethereum operations.
-///
-/// This function creates a cryptographically secure key pair using the secp256k1
-/// curve, which is the same curve used by Ethereum. The generated keys can be
-/// used for creating stealth addresses and signing transactions.
-///
-/// # Arguments
-///
-/// * `secp` - A secp256k1 context with all capabilities enabled
-///
-/// # Returns
-///
-/// Returns a `FheDKSAPResult<EthereumKeyPair>` containing the generated key pair
-/// or an error if key generation fails.
-///
-/// # Example
-///
-/// ```rust
-/// use secp256k1::Secp256k1;
-/// use fhe_dksap::generate_ethereum_key_pair;
-///
-/// let secp = Secp256k1::new();
-/// let keypair = generate_ethereum_key_pair(&secp).unwrap();
-/// println!("Public key: {:?}", keypair.public_key);
-/// ```
-///
-/// # Errors
-///
-/// Returns `FheDKSAPError::KeyGenerationError` if the key generation process fails.
-pub fn generate_ethereum_key_pair(
-    secp: &Secp256k1<secp256k1::All>,
-) -> FheDKSAPResult<EthereumKeyPair> {
-    let (secret_key, public_key) = secp.generate_keypair(&mut rand::rng());
+impl StealthAddress {
+    /// Returns the destination Ethereum address.
+    #[must_use]
+    pub const fn address(&self) -> EthereumAddress {
+        self.address
+    }
 
-    Ok(EthereumKeyPair {
+    /// Returns the encrypted sender scalar to publish with the announcement.
+    #[must_use]
+    pub const fn encrypted_ephemeral_secret(&self) -> &FheUint256 {
+        &self.encrypted_ephemeral_secret
+    }
+
+    /// Consumes the announcement and returns its public parts.
+    #[must_use]
+    pub fn into_parts(self) -> (EthereumAddress, FheUint256) {
+        (self.address, self.encrypted_ephemeral_secret)
+    }
+}
+
+impl fmt::Debug for StealthAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StealthAddress")
+            .field("address", &self.address)
+            .field("encrypted_ephemeral_secret", &"<ciphertext>")
+            .finish()
+    }
+}
+
+/// Generates a cryptographically random secp256k1 key pair.
+#[must_use]
+pub fn generate_ethereum_key_pair<C: secp256k1::Signing>(secp: &Secp256k1<C>) -> EthereumKeyPair {
+    let (secret_key, public_key) = secp.generate_keypair(&mut rand::rng());
+    EthereumKeyPair {
         secret_key,
         public_key,
-    })
+    }
 }
 
-/// Generates a new FHE key pair for encrypted operations.
+/// Generates one tagged TFHE client/server/public key set.
 ///
-/// This function creates a client-server key pair for FHE operations. The client
-/// key is used for encryption and decryption, while the server key enables
-/// computations on encrypted data without revealing the underlying values.
-///
-/// # Arguments
-///
-/// * `config` - The FHE configuration specifying security parameters and performance settings
-///
-/// # Returns
-///
-/// Returns a `FheDKSAPResult<FheKeyPair>` containing the generated FHE key pair
-/// or an error if key generation fails.
-///
-/// # Example
-///
-/// ```rust
-/// use tfhe::ConfigBuilder;
-/// use fhe_dksap::generate_fhe_key_pair;
-///
-/// let config = ConfigBuilder::default().build();
-/// let fhe_keypair = generate_fhe_key_pair(config).unwrap();
-/// ```
+/// Key generation is expensive and the receiver is expected to reuse this key
+/// set. Use security parameters appropriate for the deployment.
+#[must_use]
+pub fn generate_fhe_key_pair(config: Config) -> FheKeyPair {
+    let (mut client_key, mut server_key) = generate_keys(config);
+
+    let tag = rand::random::<u128>();
+    client_key.tag_mut().set_u128(tag);
+    server_key.tag_mut().set_u128(tag);
+
+    let public_key = FhePublicKey::new(&client_key);
+    FheKeyPair {
+        client_key,
+        server_key,
+        public_key,
+    }
+}
+
+/// Encrypts a secp256k1 secret key for the receiver.
+#[must_use]
+pub fn encrypt_secret_key(secret_key: &SecretKey, public_key: &FhePublicKey) -> FheUint256 {
+    FheUint256::encrypt(
+        utils::bytes_be_to_u256(secret_key.secret_bytes()),
+        public_key,
+    )
+}
+
+/// Adds two secp256k1 public keys.
 ///
 /// # Errors
 ///
-/// Returns `FheDKSAPError::KeyGenerationError` if the FHE key generation process fails.
-pub fn generate_fhe_key_pair(config: Config) -> FheDKSAPResult<FheKeyPair> {
-    let (client_key, server_key) = generate_keys(config);
-
-    Ok(FheKeyPair {
-        public_key: client_key,
-        secret_key: server_key,
-    })
+/// Returns [`Error::PointAtInfinity`] when the points cancel each other.
+pub fn combine_public_keys(
+    first: &Secp256k1PublicKey,
+    second: &Secp256k1PublicKey,
+) -> Result<Secp256k1PublicKey> {
+    first.combine(second).map_err(|_| Error::PointAtInfinity)
 }
 
-/// Encrypts a secp256k1 secret key using FHE.
-///
-/// This function converts a secp256k1 secret key to a U256 representation and
-/// encrypts it using the provided FHE client key. The encrypted key can be used
-/// in FHE computations without revealing the original secret key.
-///
-/// # Arguments
-///
-/// * `secret_key` - The secp256k1 secret key to encrypt
-/// * `fhe_client_key` - The FHE client key used for encryption
-///
-/// # Returns
-///
-/// Returns an `FheUint256` containing the encrypted secret key.
-///
-/// # Example
-///
-/// ```rust
-/// use fhe_dksap::{generate_ethereum_key_pair, generate_fhe_key_pair, encrypt_secret_key};
-/// use secp256k1::Secp256k1;
-/// use tfhe::ConfigBuilder;
-///
-/// let secp = Secp256k1::new();
-/// let config = ConfigBuilder::default().build();
-///
-/// let eth_keypair = generate_ethereum_key_pair(&secp).unwrap();
-/// let fhe_keypair = generate_fhe_key_pair(config).unwrap();
-///
-/// let encrypted_sk = encrypt_secret_key(
-///     eth_keypair.secret_key,
-///     &fhe_keypair.public_key,
-/// );
-/// ```
-pub fn encrypt_secret_key(secret_key: SecretKey, fhe_client_key: &ClientKey) -> FheUint256 {
-    let sk_u256 = utils::bytes_be_to_u256(&secret_key.secret_bytes());
-    FheUint256::encrypt(sk_u256, fhe_client_key)
-}
-
-/// Combines two secp256k1 public keys using elliptic curve point addition.
-///
-/// This function performs point addition on the secp256k1 curve to combine two
-/// public keys. This operation is used in the stealth address generation process
-/// to create the final stealth address public key.
-///
-/// # Arguments
-///
-/// * `pk1` - The first public key to combine
-/// * `pk2` - The second public key to combine
-///
-/// # Returns
-///
-/// Returns a `FheDKSAPResult<PublicKey>` containing the combined public key
-/// or an error if the combination fails.
-///
-/// # Example
-///
-/// ```rust
-/// use fhe_dksap::{generate_ethereum_key_pair, combine_public_keys};
-/// use secp256k1::Secp256k1;
-///
-/// let secp = Secp256k1::new();
-/// let keypair1 = generate_ethereum_key_pair(&secp).unwrap();
-/// let keypair2 = generate_ethereum_key_pair(&secp).unwrap();
-///
-/// let combined_pk = combine_public_keys(
-///     &keypair1.public_key,
-///     &keypair2.public_key,
-/// ).unwrap();
-/// ```
+/// Creates a fresh one-time stealth-address announcement.
 ///
 /// # Errors
 ///
-/// Returns `FheDKSAPError::KeyCombinationError` if the public key combination
-/// fails due to invalid keys or cryptographic constraints.
-///
-/// # Mathematical Background
-///
-/// The combination is performed using elliptic curve point addition:
-/// `P_combined = P1 + P2` where `+` represents point addition on the secp256k1 curve.
-pub fn combine_public_keys(pk1: &PublicKey, pk2: &PublicKey) -> FheDKSAPResult<PublicKey> {
-    pk1.combine(pk2).map_err(|e| {
-        FheDKSAPError::KeyCombinationError(format!("Failed to combine public keys: {}", e))
-    })
+/// Returns [`Error::PointAtInfinity`] in the negligible event that the two
+/// public keys cancel. Callers may retry with a new ephemeral key.
+pub fn generate_stealth_address<C: secp256k1::Signing>(
+    secp: &Secp256k1<C>,
+    receiver_spending_public_key: &Secp256k1PublicKey,
+    receiver_fhe_public_key: &FhePublicKey,
+) -> Result<StealthAddress> {
+    let ephemeral = generate_ethereum_key_pair(secp);
+    generate_stealth_address_with_secret(
+        secp,
+        receiver_spending_public_key,
+        receiver_fhe_public_key,
+        ephemeral.secret_key(),
+    )
 }
 
-/// Generates a stealth address for a receiver using their public keys.
+/// Creates a stealth-address announcement from a caller-supplied ephemeral key.
 ///
-/// This function implements the core stealth address generation algorithm. It creates
-/// a new ephemeral key pair, combines it with the receiver's public key to generate
-/// a stealth address, and encrypts the ephemeral secret key for later recovery.
-///
-/// # Arguments
-///
-/// * `secp` - A secp256k1 context with all capabilities enabled
-/// * `receiver_eth_public_key` - The receiver's secp256k1 public key
-/// * `receiver_fhe_public_key` - The receiver's FHE client key for encryption
-///
-/// # Returns
-///
-/// Returns a `FheDKSAPResult<StealthAddress>` containing the generated stealth address
-/// and associated encrypted data, or an error if generation fails.
-///
-/// # Example
-///
-/// ```rust
-/// use fhe_dksap::{generate_ethereum_key_pair, generate_fhe_key_pair, generate_stealth_address};
-/// use secp256k1::Secp256k1;
-/// use tfhe::ConfigBuilder;
-///
-/// let secp = Secp256k1::new();
-/// let config = ConfigBuilder::default().build();
-///
-/// // Receiver setup
-/// let receiver_eth_keypair = generate_ethereum_key_pair(&secp).unwrap();
-/// let receiver_fhe_keypair = generate_fhe_key_pair(config).unwrap();
-///
-/// // Generate stealth address
-/// let stealth_address = generate_stealth_address(
-///     &secp,
-///     &receiver_eth_keypair.public_key,
-///     &receiver_fhe_keypair.public_key,
-/// ).unwrap();
-///
-/// println!("Stealth address: {}", stealth_address.stealth_address);
-/// ```
+/// This is useful for deterministic tests, hardware wallets, and applications
+/// that manage randomness outside this crate. Never reuse an ephemeral secret.
 ///
 /// # Errors
 ///
-/// Returns `FheDKSAPError::KeyGenerationError` if ephemeral key generation fails,
-/// or `FheDKSAPError::KeyCombinationError` if public key combination fails.
-///
-/// # Protocol Details
-///
-/// The stealth address generation follows these steps:
-/// 1. Generate ephemeral key pair (sk₁, pk₁)
-/// 2. Combine public keys: pk_z = pk₁ + pk_receiver
-/// 3. Generate stealth address from pk_z
-/// 4. Encrypt sk₁ with receiver's FHE public key
-pub fn generate_stealth_address(
-    secp: &Secp256k1<secp256k1::All>,
-    receiver_eth_public_key: &PublicKey,
-    receiver_fhe_public_key: &ClientKey,
-) -> FheDKSAPResult<StealthAddress> {
-    // Generate ephemeral key pair for this transaction
-    let ephemeral_key_pair = generate_ethereum_key_pair(secp).map_err(|e| {
-        FheDKSAPError::KeyGenerationError(format!("Failed to generate ephemeral key pair: {}", e))
-    })?;
-
-    // Combine public keys: pk_z = pk_1 + pk_2
-    let pk_z = ephemeral_key_pair
-        .public_key
-        .combine(receiver_eth_public_key)
-        .map_err(|e| {
-            FheDKSAPError::KeyCombinationError(format!("Failed to combine public keys: {}", e))
-        })?;
-
-    // Generate stealth address from combined public key
-    let stealth_address = utils::pk_to_eth_address(&pk_z);
-
-    // Encrypt the ephemeral private key using receiver's FHE public key
-    let sk1_u256 = utils::bytes_be_to_u256(&ephemeral_key_pair.secret_key.secret_bytes());
-    let encrypted_secret_key = FheUint256::encrypt(sk1_u256, receiver_fhe_public_key);
+/// Returns [`Error::PointAtInfinity`] when the public keys cancel.
+pub fn generate_stealth_address_with_secret<C: secp256k1::Signing>(
+    secp: &Secp256k1<C>,
+    receiver_spending_public_key: &Secp256k1PublicKey,
+    receiver_fhe_public_key: &FhePublicKey,
+    ephemeral_secret: &SecretKey,
+) -> Result<StealthAddress> {
+    let ephemeral_public_key = ephemeral_secret.public_key(secp);
+    let combined = combine_public_keys(&ephemeral_public_key, receiver_spending_public_key)?;
 
     Ok(StealthAddress {
-        stealth_address,
-        encrypted_secret_key,
-        ephemeral_key_pair,
+        address: ethereum_address(&combined),
+        encrypted_ephemeral_secret: encrypt_secret_key(ephemeral_secret, receiver_fhe_public_key),
     })
 }
 
-/// Recovers the private key for a stealth address using FHE operations.
+/// Homomorphically computes `(receiver + ephemeral) mod n`.
 ///
-/// This function implements the stealth address recovery algorithm. It uses FHE
-/// operations to compute the private key for a stealth address without revealing
-/// the intermediate values during computation.
-///
-/// # Arguments
-///
-/// * `secp` - A secp256k1 context with all capabilities enabled
-/// * `fhe_keypair` - The receiver's FHE key pair for decryption and computation
-/// * `enc_receiver_secret_key` - The receiver's secret key encrypted with their FHE public key
-/// * `enc_sender_secret_key` - The ephemeral secret key encrypted with the receiver's FHE public key
-///
-/// # Returns
-///
-/// Returns a `FheDKSAPResult<EthereumKeyPair>` containing the recovered key pair
-/// for the stealth address, or an error if recovery fails.
-///
-/// # Example
-///
-/// ```rust
-/// use fhe_dksap::{
-///     generate_ethereum_key_pair, generate_fhe_key_pair, generate_stealth_address,
-///     recover_secret_key, encrypt_secret_key
-/// };
-/// use secp256k1::Secp256k1;
-/// use tfhe::ConfigBuilder;
-///
-/// let secp = Secp256k1::new();
-/// let config = ConfigBuilder::default().build();
-///
-/// // Receiver setup
-/// let receiver_eth_keypair = generate_ethereum_key_pair(&secp).unwrap();
-/// let receiver_fhe_keypair = generate_fhe_key_pair(config).unwrap();
-/// let receiver_enc_secret_key = encrypt_secret_key(
-///     receiver_eth_keypair.secret_key,
-///     &receiver_fhe_keypair.public_key,
-/// );
-///
-/// // Generate stealth address
-/// let stealth_address = generate_stealth_address(
-///     &secp,
-///     &receiver_eth_keypair.public_key,
-///     &receiver_fhe_keypair.public_key,
-/// ).unwrap();
-///
-/// // Recover stealth address private key
-/// let recovered_keypair = recover_secret_key(
-///     &secp,
-///     &receiver_fhe_keypair,
-///     &receiver_enc_secret_key,
-///     &stealth_address.encrypted_secret_key,
-/// ).unwrap();
-/// ```
+/// This step requires only the public TFHE server key, so it can be outsourced.
+/// The branch avoids overflowing the 256-bit ciphertext when the mathematical
+/// sum is greater than or equal to the secp256k1 order `n`.
 ///
 /// # Errors
 ///
-/// Returns `FheDKSAPError::KeyGenerationError` if the recovered private key
-/// is invalid or if key creation fails.
+/// Returns [`Error::FheKeyMismatch`] when either ciphertext's TFHE tag differs
+/// from the evaluation key tag.
+pub fn evaluate_encrypted_stealth_secret(
+    server_key: &ServerKey,
+    encrypted_receiver_secret: &FheUint256,
+    encrypted_ephemeral_secret: &FheUint256,
+) -> Result<FheUint256> {
+    ensure_same_fhe_key(server_key, encrypted_receiver_secret)?;
+    ensure_same_fhe_key(server_key, encrypted_ephemeral_secret)?;
+
+    Ok(with_server_key_as_context(server_key.clone(), || {
+        let threshold = utils::secp256k1_order() - encrypted_ephemeral_secret;
+        encrypted_receiver_secret.ge(&threshold).if_then_else(
+            &(encrypted_receiver_secret - &threshold),
+            &(encrypted_ephemeral_secret + encrypted_receiver_secret),
+        )
+    }))
+}
+
+/// Decrypts an evaluated ciphertext into the stealth-address spending key.
 ///
-/// # Protocol Details
+/// # Errors
 ///
-/// The recovery process follows these steps:
-/// 1. Set the FHE server key for computations
-/// 2. Perform modulo operation: C = (C₁ + C₂) mod n
-/// 3. Decrypt the result to get the stealth address private key
-/// 4. Convert the result back to a secp256k1 secret key
-pub fn recover_secret_key(
-    secp: &Secp256k1<secp256k1::All>,
-    fhe_keypair: &FheKeyPair,
-    enc_receiver_secret_key: &FheUint256,
-    enc_sender_secret_key: &FheUint256,
-) -> FheDKSAPResult<EthereumKeyPair> {
-    // Set the server key for FHE operations
-    set_server_key(fhe_keypair.secret_key.clone());
+/// Returns [`Error::FheKeyMismatch`] for the wrong client key,
+/// [`Error::ZeroScalar`] for the point-at-infinity result, or
+/// [`Error::InvalidScalar`] for any other invalid scalar.
+pub fn decrypt_stealth_secret<C: secp256k1::Signing>(
+    secp: &Secp256k1<C>,
+    client_key: &ClientKey,
+    encrypted_stealth_secret: &FheUint256,
+) -> Result<EthereumKeyPair> {
+    ensure_same_fhe_key(client_key, encrypted_stealth_secret)?;
 
-    // Get the secp256k1 order for modulo operation
-    let n = FheUint256::encrypt(utils::secp256k1_order(), &fhe_keypair.public_key);
+    let scalar = encrypted_stealth_secret.decrypt(client_key);
+    let bytes = utils::u256_to_bytes_be(scalar);
+    if bytes == [0; 32] {
+        return Err(Error::ZeroScalar);
+    }
 
-    // Perform modulo operation: C = (C_1 + C_2) % n
-    let x = n - enc_sender_secret_key;
-    let c = enc_receiver_secret_key.ge(x.clone()).if_then_else(
-        &(enc_receiver_secret_key - x),
-        &(enc_sender_secret_key + enc_receiver_secret_key),
-    );
+    let secret_key = SecretKey::from_byte_array(bytes)
+        .map_err(|error| Error::InvalidScalar(error.to_string()))?;
+    Ok(EthereumKeyPair::from_secret_key(secp, secret_key))
+}
 
-    // Decrypt the result to get the stealth address private key
-    let sk_z_u256 = c.decrypt(&fhe_keypair.public_key);
+/// Evaluates and decrypts a stealth-address spending key in one call.
+///
+/// Use [`evaluate_encrypted_stealth_secret`] and [`decrypt_stealth_secret`]
+/// separately when evaluation is outsourced.
+///
+/// # Errors
+///
+/// Returns the errors documented by the two underlying operations.
+pub fn recover_secret_key<C: secp256k1::Signing>(
+    secp: &Secp256k1<C>,
+    fhe_key_pair: &FheKeyPair,
+    encrypted_receiver_secret: &FheUint256,
+    encrypted_ephemeral_secret: &FheUint256,
+) -> Result<EthereumKeyPair> {
+    let evaluated = evaluate_encrypted_stealth_secret(
+        fhe_key_pair.server_key(),
+        encrypted_receiver_secret,
+        encrypted_ephemeral_secret,
+    )?;
+    decrypt_stealth_secret(secp, fhe_key_pair.client_key(), &evaluated)
+}
 
-    // Convert U256 back to SecretKey
-    let sk_z_bytes = utils::u256_to_bytes_be(sk_z_u256);
-    let sk_z = SecretKey::from_byte_array(sk_z_bytes).map_err(|e| {
-        FheDKSAPError::KeyGenerationError(format!("Failed to create SecretKey from bytes: {}", e))
-    })?;
+/// Converts an uncompressed secp256k1 public key to an Ethereum address.
+#[must_use]
+pub fn ethereum_address(public_key: &Secp256k1PublicKey) -> EthereumAddress {
+    EthereumAddress::new(utils::ethereum_address_bytes(public_key))
+}
 
-    Ok(EthereumKeyPair {
-        secret_key: sk_z,
-        public_key: sk_z.public_key(secp),
-    })
+fn ensure_same_fhe_key<K: Tagged>(key: &K, ciphertext: &FheUint256) -> Result<()> {
+    if key.tag().is_empty() || key.tag() != ciphertext.tag() {
+        return Err(Error::FheKeyMismatch);
+    }
+    Ok(())
 }

@@ -1,7 +1,7 @@
 [package]
 name = "fhe_dksap"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Vedant Chainani <vedantchainani1084@gmail.com>"]
 description = "Fully Homomorphic Encryption based Dual-Key Stealth Address Protocol for enhanced privacy in blockchain transactions"
 readme = "README.md"
@@ -11,17 +11,33 @@ homepage = "https://github.com/Envoy-VC/fhe-dksap"
 documentation = "https://docs.rs/fhe_dksap"
 keywords = ["fhe", "stealth-address", "ethereum", "cryptography", "dksap"]
 categories = ["cryptography", "security"]
-rust-version = "1.81.0"
+rust-version = "1.91.1"
 
 # Publishing configuration
 publish = true
 
+[features]
+default = []
+avx512 = ["tfhe/avx512"]
+
 [dependencies]
 hex = "0.4.3"
-secp256k1 = { version = "0.31.1", features = ["alloc", "std", "rand"] }
-sha3 = "0.10.8"
-tfhe = { version = "1.3.1", features = ["boolean", "shortint", "integer"] }
+secp256k1 = { version = "0.31.1", features = ["rand", "std"] }
+sha3 = "0.12.0"
+tfhe = { version = "1.6.3", default-features = false, features = ["integer"] }
+thiserror = "2.0.18"
 
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
 
 [package.metadata.docs.rs]
-rustc-args = ["--cfg", "docsrs"]
+all-features = true
