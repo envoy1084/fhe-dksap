@@ -23,7 +23,7 @@ avx512 = ["tfhe/avx512"]
 
 [dependencies]
 hex = "0.4.3"
-secp256k1 = { version = "0.31.1", features = ["rand", "std"] }
+secp256k1 = { version = "0.33.1", features = ["rand", "std"] }
 sha3 = "0.12.0"
 tfhe = { version = "1.6.3", default-features = false, features = ["integer"] }
 thiserror = "2.0.18"
